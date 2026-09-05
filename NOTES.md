@@ -16,7 +16,7 @@
 | 0 | スキーマ定義 | ✅完了 |
 | 1 | 1000万行投入 | ✅完了 |
 | 2 | ベースライン計測 | ✅完了 |
-| 3 | インデックス比較実験 | 未 |
+| 3 | インデックス比較実験 | ✅完了 |
 | 4 | Keyset実装 | 未 |
 | 5 | COUNT問題 | 未 |
 | 6 | p95計測 | 未 |
@@ -129,24 +129,51 @@ status 分布（重大な発見あり）:
 
 ## Phase 3: インデックス設計の比較実験
 
-予測:
-- どのパターンで Sort ノードが消えるか: ____
-- status=4(refunded, 1%) でパターンB の Rows Removed by Filter: ____ 行
+予測（Claude の予測）:
+- どのパターンで Sort ノードが消えるか: **C のみ**。A は created_at 順は得るが status を Filter で弾く。
+  B も先頭が created_at なので status は Filter。C だけ status 等値→created_at 連続で Sort 不要。
+- A/B は status=1 でも Index を使い、created_at 降順スキャンしながら status!=1 を捨てる想定。
+  paid は 60% なので 20 行返すのに約 33 行読む（許容）。
+- status=4(refunded, 1%) でパターン B の Rows Removed by Filter: **約 2000 行**（20/0.01）。
+- idx_c サイズ: 3 列 btree で **約 300MB** と予想。
 
-実測:
+実測（status=1 paid, LIMIT 20, warm）:
 
-| パターン | 実行時間 | Buffers | Sortノード | Rows Removed by Filter |
+| パターン | 実行時間(warm) | Buffers | スキャン種別/Sort | Rows Removed by Filter |
 |---|---|---|---|---|
-| なし | | | | |
-| A (created_at) | | | | |
-| B (created_at, status) | | | | |
-| C (status, created_at, id) | | | | |
+| なし | 314ms | hit=73,602 | Parallel Seq Scan + **Sort(top-N)** | 400万(全表) |
+| A (created_at) | 0.015ms | hit=41 | Index Scan, **Sortなし**, Filter:status | 18 |
+| B (created_at DESC, status) | 0.015ms | hit=23 | Index Scan, **Sortなし**, **Index Cond:status** | 0 |
+| C (status, created_at DESC, id DESC) | 0.015ms | hit=24 | Index Scan, **Sortなし**, **Index Cond:status** | 0 |
 
-- idx_c サイズ: ____
-- DESC有無の逆順スキャン検証: ____
+インデックスサイズ: A=214MB / B=300MB / C=387MB（列が増えるほど大きい＝書込コスト増）
 
-ズレた点と理由:
--
+### ★ 選択率による評価の反転（§5.2 の核心）— status=4 refunded(1%) で再計測
+
+| パターン | 実行時間(warm) | Buffers | Rows Removed by Filter |
+|---|---|---|---|
+| A (created_at のみ) | 0.86ms | **hit=2,527** | **2,498** ← Filter爆発 |
+| B (created_at, status) | 0.031ms | hit=32 | 0（Index Cond） |
+| C (status, created_at, id) | 0.014ms | hit=24 | 0（Index Cond） |
+
+### §5.3 DESC 指定は必要か（逆順スキャン検証）
+- 全ASCの idx (status, created_at, id) でも `ORDER BY created_at DESC, id DESC` は
+  **Index Scan Backward** で処理でき **Sort なし**。→「DESCを付けないとDESCに使えない」は誤解。
+- 方向混在 `created_at DESC, id ASC` にすると **Incremental Sort** が出現（created_atは整列済みなので
+  同値グループ内のidだけ部分ソート）。→ 方向が混在するときだけ DESC 明示に意味がある。
+
+ズレた点と理由（★重要）:
+1. **予測「B は status を Filter で弾く」は外れ**。実際は `Index Cond: status=1`。
+   理由: idx_b は status を2列目に**含む**ため、ヒープに行かず**インデックス内で status を評価**できる。
+   → 計画書が想定した「B で Filter 爆発」は、現代 PG では B では起きない。
+2. **真の Filter 爆発は パターンA（status を含まない index）で起きた**。
+   refunded で Rows Removed by Filter=2,498 / Buffers 2,527（paid の 100倍）。
+   → §5.2 の教訓「同じ index でも選択率で評価が反転」は正しいが、それが露呈するのは
+     「ソート列だけの index（A）」の場合。予測2000行に対し実測2498行でほぼ的中。
+3. A/B/C とも paid では 0.015ms・数十ブロックで横並び（Sort が消えた効果は絶大）。
+   差が出るのは (a)低選択率 refunded と (b)keyset で深いページを繰るとき（Phase 4 で確認）。
+   → 1ページ目だけ見ると A/B/C の優劣が見えない。ここが Phase 4/6 の伏線。
+4. C を Phase 4 用の正解として最終的に残した（他は DROP 済み）。
 
 ---
 
