@@ -17,7 +17,7 @@
 | 1 | 1000万行投入 | ✅完了 |
 | 2 | ベースライン計測 | ✅完了 |
 | 3 | インデックス比較実験 | ✅完了 |
-| 4 | Keyset実装 | 未 |
+| 4 | Keyset実装 | ✅完了 |
 | 5 | COUNT問題 | 未 |
 | 6 | p95計測 | 未 |
 | 7 | 発展 | 未 |
@@ -179,10 +179,49 @@ status 分布（重大な発見あり）:
 
 ## Phase 4: Keyset Pagination の実装
 
-- Index Cond に ROW(...) が入ったか: ____
-- OR手書き版との EXPLAIN 差分: ____
-- カーソルが何ページ目でも Buffers 一定か: ____
-- iso8601(6) → to_s に変えるとテストが落ちるか: ____
+予測（Claude）:
+- 行値比較 `(created_at,id) < (?,?)` は Index Cond に落ち、Buffers 数十・Sortなし。
+- OR手書き `created_at<? OR (created_at=? AND id<?)` は Index Cond に落ちず Filter になり、
+  カーソルより新しい側を大量に読んで捨てる（深いページほど悪化）想定。
+- keyset はカーソルが深いページでも Buffers ほぼ一定（OFFSET と違い先頭から数えない）。
+
+実測（SQLレベル §6.1〜6.3）:
+- Index Cond に ROW(...) が入ったか: **✅ 入った**
+  `Index Cond: ((status = 1) AND (ROW(created_at, id) < ROW('2026-08-10 ...', 9368553)))`
+  warm 27ブロック / 0.196ms、Sort なし。目標プラン(§6.3)通り。
+- OR手書き版との EXPLAIN 差分: **★決定的**
+  | 書き方 | Index Cond | Filter | Rows Removed | Buffers | 時間 |
+  |---|---|---|---|---|---|
+  | 行値比較 (a,b)<(?,?) | status + ROW(...) | なし | 0 | **27** | 0.2ms |
+  | OR手書き | status のみ | OR式 | **100,001** | **100,518** | **4637ms** |
+  → OR は「カーソルより新しい側10万件を全部読んで捨てる」。行値比較の**約3700倍のブロック**。
+  論理的には等価でも、プランナは OR を Index Cond に落とせない。これが本課題で最も実用的な知識。
+- カーソルが何ページ目でも Buffers 一定か: **✅ 一定**
+  1ページ目相当(OFFSET 10万境界) hit=27 / 深いページ(OFFSET 300万境界) hit=24。
+  → OFFSET は先頭から数えるので深いほど悪化するが、keyset は「境界へ直行」なので不変。
+    これが Phase 6 の p95 で効いてくる本質。
+- iso8601(6) → to_s に変えるとテストが落ちるか: **✅ 落ちた**
+  to_s（秒精度に丸め）にすると同一秒境界で期待200件→実測1000件（同じ行を無限再読込＝重複爆発）。
+  iso8601(6) に戻すと全テスト green。§6.5 の「境界で取りこぼす/重複する」を実証。
+
+Rails 実装（§6.4〜6.7）:
+- app/models/order.rb: scope page_order / seek_after（行値比較）
+- app/queries/cursor.rb: iso8601(6) + Base64 urlsafe（不透明カーソル）
+- app/queries/order_page_query.rb: LIMIT per_page+1 で has_next 判定（COUNT不要）
+- app/controllers/api/orders_controller.rb + routes（GET /api/orders）
+- test/queries/order_page_query_test.rb: 自前データ（同一秒の塊を境界にまたがせる）で
+  重複・欠落・順序・壊れカーソル・iso8601精度を検証 → 3 runs green
+
+E2E 検証:
+- 単体テスト(テストDB): 3 runs 0 failures
+- 1000万行(dev DB)に対し runner でページ送り: page1↔page2 重複0件・時系列連続 ✅
+- HTTP: GET /api/orders?status=paid → 20件+next_cursor、cursor送りで page2 取得 ✅
+  refunded でも status 絞り込み動作 ✅
+- 注意: JSON表示の created_at はミリ秒精度(as_json既定)だが、カーソルは内部で
+  record.created_at.iso8601(6) を使うので境界精度は保たれる（表示とカーソルは別物）。
+
+TODO(後続): idx_c はまだ生SQL作成でマイグレーション未化。テストDBには idx_c が無い
+（正しさ検証はindex非依存なので影響なし）。Phase 7 の安全なマイグレーションで add_index する。
 
 ---
 
