@@ -19,7 +19,7 @@
 | 3 | インデックス比較実験 | ✅完了 |
 | 4 | Keyset実装 | ✅完了 |
 | 5 | COUNT問題 | ✅完了 |
-| 6 | p95計測 | 未 |
+| 6 | p95計測 | ✅完了 |
 | 7 | 発展 | 未 |
 
 ---
@@ -57,6 +57,7 @@
 - last_analyze: 2026-08-22 07:36:18 UTC（入っている ✅）
 
 status 分布（重大な発見あり）:
+
 | status | 実測件数 | 実測% | 計画書の意図% |
 |---|---|---|---|
 | 1 paid | 5,999,498 | 60.0% | 60% ✅ |
@@ -74,6 +75,7 @@ status 分布（重大な発見あり）:
 - SQL の CASE は WHEN ごとに式を再評価する、という基本の落とし穴の実例。
 
 修正後（単一乱数 r を FROM 側で1回生成 → 累積しきい値で分岐）で再投入した結果、意図通りに:
+
 | status | 件数 | % | 意図% |
 |---|---|---|---|
 | 0 pending | 1,298,358 | 12.98% | 13% ✅ |
@@ -190,6 +192,7 @@ status 分布（重大な発見あり）:
   `Index Cond: ((status = 1) AND (ROW(created_at, id) < ROW('2026-08-10 ...', 9368553)))`
   warm 27ブロック / 0.196ms、Sort なし。目標プラン(§6.3)通り。
 - OR手書き版との EXPLAIN 差分: **★決定的**
+
   | 書き方 | Index Cond | Filter | Rows Removed | Buffers | 時間 |
   |---|---|---|---|---|---|
   | 行値比較 (a,b)<(?,?) | status + ROW(...) | なし | 0 | **27** | 0.2ms |
@@ -203,6 +206,7 @@ status 分布（重大な発見あり）:
 
 ### ★ 低選択率 status=4 refunded(1%) でも keyset は一定か（追加検証）
 選択率が高い paid(60%) だけでなく、低い refunded(1%) でも行値比較が効くかを確認。
+
 | カーソル位置 | Index Cond | Buffers | 時間(warm) |
 |---|---|---|---|
 | 浅い(1000件目) | status=4 AND ROW(...) | hit=24 | 0.020ms |
@@ -269,15 +273,38 @@ TODO(後続): idx_c はまだ生SQL作成でマイグレーション未化。テ
 
 ## Phase 6: p95 の計測と比較
 
+予測（Claude）:
+- p50 は両者とも近い（OFFSETも浅い位置なら速い）。
+- p95/p99 で OFFSET が桁違いに悪化（深い位置で work_mem 溢れ・全走査）。Keyset は横ばい。
+- Keyset の p95 は数ms以内（DB 0.02ms + AR生成/整形）。目標 p95<100ms は Keyset で達成、OFFSETは未達と予想。
+
+実測（200サンプル、warm、アプリ層=OrderPageQuery/AR経由の時間）:
+
 | 方式 | p50 | p95 | p99 | max |
 |---|---|---|---|---|
-| OFFSET | | | | |
-| Keyset | | | | |
+| OFFSET (1回目) | 42.70ms | 79.06ms | **103.35ms** | **6527.50ms** |
+| OFFSET (2回目) | 37.85ms | 74.78ms | 98.78ms | 126.53ms |
+| Keyset (1回目) | 4.85ms | **6.30ms** | 9.86ms | 15.92ms |
+| Keyset (2回目) | 1.07ms | **1.49ms** | 7.44ms | 19.45ms |
 
-- 目標 p95 < 100ms 達成: ____
-- StackProf アプリ層内訳: ____
+- 目標 p95 < 100ms 達成: **✅ Keyset は p95 6.3ms で余裕達成**。OFFSET は p99 が 100ms超・max 6.5秒で未達。
+- 読み取り:
+  - **p50 でも既に OFFSET 40ms vs Keyset 1-5ms**（OFFSET は平均的な位置でも work_mem 溢れで遅い）。
+  - 決定的な差は**裾**: OFFSET max 6527ms に対し Keyset max ~16-19ms。
+    「平均は嘘をつく」の実物。p50だけ見ると"9倍差"だが、裾では"数百倍差"。
+  - Keyset は浅い/深いカーソルが混ざっても p95 が跳ねない（Phase4の Buffers 一定が効いている）。
+
+- StackProf アプリ層内訳（200回 call + attributes 展開, wall）:
+  - PG::Connection#exec（実DB実行） 約10.7% ← **SQL自体は1割程度**
+  - GC (marking+sweeping) 約15.7% ← AR オブジェクト生成に伴うGC
+  - ActiveModel の deserialize / LazyAttributeSet / String#sub 等 ← AR の行→オブジェクト変換
+  - Bootsnap / BacktraceCleaner ← dev モード固有（本番では消える）
+  - 学び: **「遅い=SQLが悪い」とは限らない**。keyset の数ms は大半が Ruby 側
+    （AR生成・GC）であり、SQL は既に極小。ここから先の最適化は as_json 削減や
+    必要列限定など**アプリ層**が効く。本番modeなら bootsnap 等が消えてさらに軽い。
 
 ---
 
 ## Phase 7: 発展課題（任意）
+
 -
