@@ -10,4 +10,14 @@ class Order < ApplicationRecord
   scope :seek_after, ->(created_at, id) {
     where("(orders.created_at, orders.id) < (?, ?)", created_at, id)
   }
+
+  # Phase 5 選択肢2: 近似カウント（§5 の approximate_count）。
+  # プランナが見積もる Plan Rows を使う。全走査せず数ミリ秒で「約N件」を返せる。
+  # 精度は直近の ANALYZE に依存する（Google の「約1,230,000件」と同じ発想）。
+  def self.approximate_count(status)
+    sql = where(status: status).to_sql
+    row = connection.select_one("EXPLAIN (FORMAT JSON) #{sql}")
+    plan = JSON.parse(row["QUERY PLAN"])
+    plan.dig(0, "Plan", "Plan Rows")
+  end
 end

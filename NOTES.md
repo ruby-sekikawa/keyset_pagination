@@ -18,7 +18,7 @@
 | 2 | ベースライン計測 | ✅完了 |
 | 3 | インデックス比較実験 | ✅完了 |
 | 4 | Keyset実装 | ✅完了 |
-| 5 | COUNT問題 | 未 |
+| 5 | COUNT問題 | ✅完了 |
 | 6 | p95計測 | 未 |
 | 7 | 発展 | 未 |
 
@@ -200,6 +200,18 @@ status 分布（重大な発見あり）:
   1ページ目相当(OFFSET 10万境界) hit=27 / 深いページ(OFFSET 300万境界) hit=24。
   → OFFSET は先頭から数えるので深いほど悪化するが、keyset は「境界へ直行」なので不変。
     これが Phase 6 の p95 で効いてくる本質。
+
+### ★ 低選択率 status=4 refunded(1%) でも keyset は一定か（追加検証）
+選択率が高い paid(60%) だけでなく、低い refunded(1%) でも行値比較が効くかを確認。
+| カーソル位置 | Index Cond | Buffers | 時間(warm) |
+|---|---|---|---|
+| 浅い(1000件目) | status=4 AND ROW(...) | hit=24 | 0.020ms |
+| 深い(9万件目≒最後) | status=4 AND ROW(...) | hit=24 | 0.019ms |
+→ **選択率に関係なく Index Cond に落ち、Buffers 24 で一定**。paid(27↔24) とほぼ同値。
+  理由: idx_c は先頭が status なので「refunded の棚」に直行し、その中は created_at 順。
+  棚のサイズ(1% か 60% か)は関係なく、境界から20件読むだけ。
+  ※Phase3 のパターンA(created_atのみ)では refunded で Buffers 2,527 に爆発したのと対照的。
+    「keyset が効くのは正しい列順(status先頭)の idx_c があってこそ」を再確認。
 - iso8601(6) → to_s に変えるとテストが落ちるか: **✅ 落ちた**
   to_s（秒精度に丸め）にすると同一秒境界で期待200件→実測1000件（同じ行を無限再読込＝重複爆発）。
   iso8601(6) に戻すと全テスト green。§6.5 の「境界で取りこぼす/重複する」を実証。
@@ -227,9 +239,31 @@ TODO(後続): idx_c はまだ生SQL作成でマイグレーション未化。テ
 
 ## Phase 5: COUNT の壁
 
-- `COUNT(*) WHERE status=1` 単体の実行時間: ____ ms
-- 3つの選択肢（総件数を出さない / 近似 / カウンタテーブル）のトレードオフ:
-  -
+予測（Claude）:
+- `COUNT(*) WHERE status=1`(600万件) は idx_c を index-only scan で全走査 → 200〜400ms 程度。
+  Phase 1 の `count(*)` 全件 121ms(warm) より、範囲が狭い分やや速いか同等と予想。
+- 近似(EXPLAINのPlan Rows)は 1ms 未満。ANALYZE 依存で誤差数%。
+
+実測:
+- `COUNT(*) WHERE status=1`(paid 600万) 単体: cold 468ms / **warm 232ms**（EXPLAIN）
+  ★プランナは index-only scan ではなく **Parallel Seq Scan** を選択（予測外れ）。
+   status=1 は60%と選択率が高すぎ、インデックスより全走査が得と判断（§11の「選択率が高すぎてSeq Scanが正解」）。
+   Buffers 約73,530。Rails経由の `.count` でも warm 138ms。
+- keyset 本体は 0.02ms。**COUNT を足した瞬間に 138〜232ms で p95<100ms を確実に割る** = COUNTの壁。
+- Phase 1 の全件 `count(*)` warm 121ms と同オーダー（範囲を絞っても全走査なら大差なし）。
+
+3つの選択肢（実装して計測）:
+
+| 方式 | 実測 | 正確さ | コスト/トレードオフ |
+|---|---|---|---|
+| ①総件数を出さない(has_next) | 0.02ms | 件数は出ない | 実装済(Phase4のLIMIT+1)。無限スクロールUIなら最適。**技術で殴らず要件を削る** |
+| ②近似(EXPLAIN Plan Rows) | **0.27ms** | 誤差0.0099%(5,999,381 vs 5,998,790) | ANALYZE 頻度に精度依存。"約N件"表示に最適。Google 検索結果と同発想 |
+| ③カウンタテーブル | 読取**1.96ms**/更新257ms | 完全一致 | 読取は速く正確だが「誰が更新し続けるか」の問題。定期バッチ=結果整合(遅延)、トリガ=常時正確だが書込ごとに競合ポイント増 |
+
+学び: 「正確な総件数が本当に必要か」をプロダクト側と交渉するのが一番効く（唯一コードを書かない解法=①）。
+実装: Order.approximate_count / OrderStat(refresh_all, count_for) + migration。
+バグ: group(:status).count は enum名文字列を返し integer列にupsertすると全部0にキャストされ衝突
+→ Order.statuses で整数コードへ明示変換して解決。
 
 ---
 

@@ -10,16 +10,22 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_08_22_044659) do
+ActiveRecord::Schema[8.1].define(version: 2026_09_06_074714) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_prewarm"
   enable_extension "pg_stat_statements"
+
+  create_table "order_stats", primary_key: "status", id: :serial, force: :cascade do |t|
+    t.bigint "count", default: 0, null: false
+    t.datetime "updated_at", null: false
+  end
 
   create_table "orders", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.integer "status", limit: 2, null: false
     t.integer "total_cents", null: false
     t.bigint "user_id", null: false
+    t.index ["status", "created_at", "id"], name: "idx_c", order: { created_at: :desc, id: :desc }
   end
 end
